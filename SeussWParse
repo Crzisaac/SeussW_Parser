@@ -1,0 +1,236 @@
+import sys
+from pathlib import Path
+import time
+import os
+import re
+
+
+class SeussWParse:
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.scanner_values = None  # the five 0.1 cm^2 detectors used to detect uniformity
+        self.log_copies = self.count_copies()  # used to count how many CI TAMU copies there are
+        self.running = False # Checks to see if the SeussW program is running
+        self.log_copy_list = self.get_log_copy_list() # List of all the CI TAMU copy names
+        self.flux_path = os.path.join(directory, "CurrentScalerReadouts.dat")
+        self.position_path = os.path.join(directory, self.log_copy_list[0] + ".txt")
+        self.beam_path = os.path.join(directory, "CurrentBeamName.dat")
+        self.beam_energy_path = os.path.join(directory, "CurrentBeamDELReB.dat")
+        self.flux = None
+        self.beam = None
+        self.beam_energy = None
+        self.specific_beam_energy = None
+        self.beam_species = None
+        self.fluence = 0.0
+        self.x_coord = None
+        self.y_coord = None
+        self.z_coord = None
+        self.tilt = None
+
+
+    def count_copies(self):
+        dirpath = self.directory
+        dir_list = os.listdir(dirpath)
+        dir_list = dir_list[int(5 * len(dir_list) / 10):]
+        dirstring = " ".join(dir_list)
+
+        file_number_list = list(map(int, re.findall(r"CI-TAMU Feb 2020\(([\d]+)\)", dirstring)))
+        return max(file_number_list)
+
+    def get_log_copy_list(self):
+        dirpath = self.directory
+        dir_list = os.listdir(dirpath)
+        dir_list = dir_list[int(5 * len(dir_list) / 10):]
+        dirstring = " ".join(dir_list)
+
+        file_number_list = list(map(int, re.findall(r"CI-TAMU Feb 2020\(([\d]+)\)", dirstring)))
+        filecopynames = list(re.findall(r"CI-TAMU Feb 2020\([\d]+\)", dirstring))
+
+        sorted_copy_names = []
+        i = 0
+        while i < len(filecopynames):
+            index = file_number_list.index(max(file_number_list))
+            sorted_copy_names.append(filecopynames[index])
+            file_number_list[index] = 0
+            i += 1
+        return sorted_copy_names
+
+    def start_time(self):
+        linestmp = self.LastNLines(30)
+        lines = linestmp[::-1]
+        timelst = []
+        for line in lines:
+            timelst = list(re.findall(r"\d\d:\d\d:\d\d", line))
+            if timelst != None:
+                break
+        h, m, s = timelst[0].split(':')
+        return int(h) * 3600 + int(m) * 60 + int(s)
+
+    def check_for_log(self, i=0):
+        self.log_copies = self.count_copies()
+        old_file = os.path.join(self.directory, r"CI-TAMU Feb 2020")
+        self.log_copy_list = self.get_log_copy_list()
+        if os.path.exists(old_file) and self.isRunning():
+            time.sleep(10)
+            new_file = os.path.join(self.directory, f"CI-TAMU Feb 2020({str(self.log_copies + 1)}).txt")
+            os.rename(old_file, new_file)
+        else:
+            self.position_path = os.path.join(self.directory, self.log_copy_list[i] + ".txt")
+
+    def parse_file_flux(self):
+        file = open(self.flux_path, "r")
+        line = file.readline()
+        self.scanner_values = list(map(int, re.findall(r'\d+', line)))[1:6]
+        self.flux = self.calc_flux()
+        file.close()
+
+    def parse_file_position(self, i=0):
+        self.check_for_log(i)
+        linestmp = self.LastNLines(30)
+        lines = linestmp[::-1]
+        for line in lines:
+            if len(line) >= 113:
+                position_values = list(map(float, re.findall(r'[-+]?\d*[.]\d+', line)))
+                self.x_coord = position_values[0]
+                self.y_coord = position_values[1]
+                self.z_coord = position_values[2]
+                self.tilt = position_values[3]
+                break
+
+
+    def isRunning(self):
+        self.running = self.scanner_values[4] == 0
+        return self.scanner_values[4] == 0
+
+    def parse_file_beam(self):
+        file = open(self.beam_path, "r")
+        line = file.readline()
+        self.beam = line
+        self.specific_beam_energy = float(line.split(" ")[0])
+        self.beam_species = line.split(" ")[2]
+        file.close()
+
+    def parse_file_beam_energy(self):
+        file = open(self.beam_energy_path, "r")
+        line = file.readline()
+        self.beam_energy = list(map(float, re.findall(r"\d*\.*\d+", line)))[2]
+        file.close()
+
+    def write_status(self):
+        fileout = open(r"status", "w")
+        status = ""
+        status += "Flux: " + "{:,}".format(self.flux) + " ions / cm^2*s\n"
+        status += "Fluence: " + "{:,.5f}".format(self.fluence) + " Ions / cm^2\n\n"
+        status += ("(x, y, z) -> (" + str(f"{self.x_coord:.3f}") + ", " +
+                   str(f"{self.y_coord:.3f}") + ", " + str(f"{self.z_coord:.3f}") + ")\n")
+        status += "Tilt: " + str(self.tilt) + " degrees\n\n"
+        status += "[" + self.beam.rstrip() + "]\n"
+        status += "Beam Species: " + self.beam_species + "\n"
+        status += "Specific Beam Energy: " + str(self.specific_beam_energy) + " MeV / u\n"
+        status += "Beam Energy: " + str(self.beam_energy) + " MeV"
+        fileout.write(status)
+        fileout.flush()
+        os.fsync(fileout.fileno())
+
+    def calc_flux(self):
+        if not self.scanner_values[4] == 0:
+            average = sum(self.scanner_values) / len(self.scanner_values)
+            flux = 10.0 * average
+            return round(flux, 5)
+        else:
+            average = sum(self.scanner_values[0:4]) / len(self.scanner_values[0:4])
+            flux = 10.0 * average
+            return round(flux, 5)
+
+    def calc_fluence(self, type="ADDITIONAL"):
+        time_interval = 1
+        self.running = self.isRunning()
+        if type == "INITIAL" and self.running:
+            start_time = self.start_time()
+            time_interval = time.time() - start_time
+            return self.flux * time_interval
+        elif not self.running:
+            self.fluence = 0.0
+            return 0.0
+        else:
+            return self.flux * time_interval
+
+    def LastNLines(self, N):
+        with open(self.position_path) as file:
+            list = []
+            for line in (file.readlines()[-N:]):
+                list.append(line)
+            file.close()
+            return list
+
+
+def main():
+    directory = Path(r"C:\Users\Crzis\Downloads\SEUSS-64")
+    Seuss = SeussWParse(directory)
+
+    interval = 1
+    last_modified_flux = os.path.getmtime(Seuss.flux_path)
+    last_modified_position = os.path.getmtime(Seuss.position_path)
+    last_modified_beam = os.path.getmtime(Seuss.beam_path)
+    last_modified_beam_energy = os.path.getmtime(Seuss.beam_energy_path)
+
+    # Initialize the values
+    Seuss.parse_file_flux()
+    Seuss.check_for_log()
+    Seuss.parse_file_position()
+    Seuss.parse_file_beam()
+    Seuss.parse_file_beam_energy()
+    Seuss.flux = Seuss.calc_flux()
+    Seuss.fluence = Seuss.calc_fluence("INITIAL")
+
+    while True:
+        Seuss.isRunning()
+        if Seuss.running:
+            Seuss.check_for_log()
+        current_modified_flux = os.path.getmtime(Seuss.flux_path)
+        if current_modified_flux != last_modified_flux:
+            last_modified_flux = current_modified_flux
+            Seuss.parse_file_flux()
+            if Seuss.running:
+                Seuss.fluence += Seuss.calc_fluence()
+            else:
+                Seuss.fluence = 0.0
+
+        current_modified_position = os.path.getmtime(Seuss.position_path)
+        if current_modified_position != last_modified_position:
+            last_modified_position = current_modified_position
+            i = 0
+            while True:
+                Seuss.parse_file_position(i)
+                if not (Seuss.x_coord is None or Seuss.y_coord is None or Seuss.z_coord is None or Seuss.tilt is None):
+                    break
+                i += 1
+        current_modified_beam = os.path.getmtime(Seuss.beam_path)
+        if current_modified_beam != last_modified_beam:
+            last_modified_beam = current_modified_beam
+            Seuss.parse_file_beam()
+
+        current_modified_beam_energy = os.path.getmtime(Seuss.beam_energy_path)
+        if current_modified_beam_energy != last_modified_beam_energy:
+            last_modified_beam_energy = current_modified_beam_energy
+            Seuss.parse_file_beam_energy()
+
+        if Seuss.x_coord is None or Seuss.y_coord is None or Seuss.z_coord is None or Seuss.tilt is None:
+            print("Change setup to initialize positions")
+            time.sleep(10)
+            continue
+        else:
+            Seuss.write_status()
+        time.sleep(interval)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('Interrupted')
+        try:
+            sys.exit(130)
+        except SystemExit:
+            os._exit(130)
